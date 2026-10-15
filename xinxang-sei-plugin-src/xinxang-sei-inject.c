@@ -1,6 +1,7 @@
 #include "xinxang-sei-inject.h"
 
 #include "xinxang-sei-internal.h"
+#include "xinxang-sntp.h"
 
 #include <obs-module.h>
 #include <util/platform.h>
@@ -163,9 +164,12 @@ void xinxang_sei_inject(obs_output_t *output, struct encoder_packet *pkt, struct
 	if (!avc && !hevc)
 		return;
 
-	const int64_t fsts_ms = cts_to_epoch_ms(pkt_time->cts);
-	if (fsts_ms < 0)
+	/* FSTS = 本机时钟（由该帧 CTS 换算）+ SNTP 偏移量。
+	   SNTP 未启用时 xinxang_sntp_correct_ms 返回原值，行为与旧版一致。 */
+	const int64_t local_ms = cts_to_epoch_ms(pkt_time->cts);
+	if (local_ms < 0)
 		return;
+	const int64_t fsts_ms = xinxang_sntp_correct_ms(local_ms);
 
 	uint8_t payload[512];
 	const size_t payload_size = xinxang_sei_build_payload(payload, sizeof(payload), fsts_ms, client_name);

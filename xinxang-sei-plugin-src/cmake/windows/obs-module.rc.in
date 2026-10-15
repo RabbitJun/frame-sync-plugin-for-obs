@@ -1,0 +1,32 @@
+#pragma code_page(65001)
+
+1 VERSIONINFO
+FILEVERSION ${XINXANG_SEI_VERSION_MAJOR},${XINXANG_SEI_VERSION_MINOR},${XINXANG_SEI_VERSION_PATCH},0
+PRODUCTVERSION ${XINXANG_SEI_VERSION_MAJOR},${XINXANG_SEI_VERSION_MINOR},${XINXANG_SEI_VERSION_PATCH},0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x2L
+FILESUBTYPE 0x0L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404B0"
+    BEGIN
+      VALUE "CompanyName", "丂渐"
+      VALUE "FileDescription", "帧同步插件 (xinxang-sei-plugin)"
+      VALUE "FileVersion", "${XINXANG_SEI_VERSION}"
+      VALUE "ProductName", "帧同步插件"
+      VALUE "ProductVersion", "${XINXANG_SEI_VERSION}"
+      VALUE "Comments", "芯象 SEI 帧同步推流插件，适用 OBS Studio 32.2.x"
+      VALUE "LegalCopyright", "Copyright (C) 丂渐"
+      VALUE "InternalName", "xinxang-sei-plugin"
+      VALUE "OriginalFilename", "xinxang-sei-plugin.dll"
+    END
+  END
+
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0804, 0x04B0
+  END
+END

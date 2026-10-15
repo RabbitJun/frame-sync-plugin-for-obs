@@ -24,6 +24,7 @@
 #include <QTimeZone>
 
 #include "xinxang-sei-inject.h"
+#include "xinxang-sntp.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("xinxang-sei", "en-US")
@@ -40,6 +41,12 @@ static struct {
 	QPointer<QLineEdit> client_name_edit;
 	QPointer<QLabel> timestamp_label;
 	QPointer<QTimer> timestamp_timer;
+	/* SNTP */
+	bool sntp_enabled;
+	struct dstr sntp_server_storage;
+	QPointer<QCheckBox> sntp_checkbox;
+	QPointer<QLineEdit> sntp_server_edit;
+	QPointer<QLabel> sntp_status_label;
 } xxs = {0};
 
 static char *get_cfg_path(void)
@@ -66,6 +73,8 @@ static void load_config(void)
 	obs_data_set_default_bool(data, "enabled", false);
 	obs_data_set_default_bool(data, "only_rtmp_output", true);
 	obs_data_set_default_string(data, "client_name", "RabbitJun");
+	obs_data_set_default_bool(data, "sntp_enabled", true);
+	obs_data_set_default_string(data, "sntp_server", "ntp.tencent.com");
 
 	xxs.cfg.enabled = obs_data_get_bool(data, "enabled");
 	xxs.cfg.only_rtmp_output = obs_data_get_bool(data, "only_rtmp_output");
@@ -78,21 +87,33 @@ static void load_config(void)
 
 	xxs.cfg.client_name = xxs.client_name_storage.array;
 
+	xxs.sntp_enabled = obs_data_get_bool(data, "sntp_enabled");
+	const char *srv = obs_data_get_string(data, "sntp_server");
+	dstr_copy(&xxs.sntp_server_storage, srv ? srv : "ntp.tencent.com");
+	dstr_depad(&xxs.sntp_server_storage);
+	if (xxs.sntp_server_storage.len == 0)
+		dstr_copy(&xxs.sntp_server_storage, "ntp.tencent.com");
+
 	/* persist defaults on first run */
 	obs_data_set_bool(data, "enabled", xxs.cfg.enabled);
 	obs_data_set_bool(data, "only_rtmp_output", xxs.cfg.only_rtmp_output);
 	obs_data_set_string(data, "client_name", xxs.cfg.client_name);
+	obs_data_set_bool(data, "sntp_enabled", xxs.sntp_enabled);
+	obs_data_set_string(data, "sntp_server", xxs.sntp_server_storage.array);
 	obs_data_save_json_safe(data, path, ".tmp", ".bak");
 
 	blog(LOG_INFO,
-	     "[xinxang-sei] config loaded from '%s' (enabled=%s, only_rtmp=%s, client_name='%s')", path,
-	     xxs.cfg.enabled ? "true" : "false", xxs.cfg.only_rtmp_output ? "true" : "false", xxs.cfg.client_name);
+	     "[xinxang-sei] config loaded from '%s' (enabled=%s, only_rtmp=%s, client_name='%s', sntp=%s@%s)", path,
+	     xxs.cfg.enabled ? "true" : "false", xxs.cfg.only_rtmp_output ? "true" : "false", xxs.cfg.client_name,
+	     xxs.sntp_enabled ? "true" : "false", xxs.sntp_server_storage.array);
 
 	obs_data_release(data);
 	bfree(path);
 }
 
-static void save_config(bool enabled, const char *client_name)
+static void apply_sntp_service(void);
+
+static void save_config(bool enabled, const char *client_name, bool sntp_enabled, const char *sntp_server)
 {
 	char *path = get_cfg_path();
 	if (!path)
@@ -102,13 +123,29 @@ static void save_config(bool enabled, const char *client_name)
 	obs_data_set_bool(data, "enabled", enabled);
 	obs_data_set_bool(data, "only_rtmp_output", true);
 	obs_data_set_string(data, "client_name", client_name ? client_name : "");
+	obs_data_set_bool(data, "sntp_enabled", sntp_enabled);
+	obs_data_set_string(data, "sntp_server", sntp_server ? sntp_server : "ntp.tencent.com");
 	obs_data_save_json_safe(data, path, ".tmp", ".bak");
 	obs_data_release(data);
 
-	blog(LOG_INFO, "[xinxang-sei] config saved to '%s' (enabled=%s, client_name='%s')", path, enabled ? "true" : "false",
-	     client_name ? client_name : "");
+	blog(LOG_INFO, "[xinxang-sei] config saved to '%s' (enabled=%s, client_name='%s', sntp=%s@%s)", path,
+	     enabled ? "true" : "false", client_name ? client_name : "", sntp_enabled ? "true" : "false",
+	     sntp_server ? sntp_server : "");
 
 	bfree(path);
+}
+
+/* 按当前配置启动/停止 SNTP 校时 */
+static void apply_sntp_service(void)
+{
+	xinxang_sntp_stop();
+	if (xxs.sntp_enabled) {
+		xinxang_sntp_start(xxs.sntp_server_storage.array, 600);
+		blog(LOG_INFO, "[xinxang-sei] FSTS 将使用校时后的时间（偏移由 SNTP 缓变施加，不会跳变）");
+	} else {
+		blog(LOG_WARNING, "[xinxang-sei] SNTP 已关闭：FSTS 用本机时钟。"
+				  "多台 OBS 各推一路时，机器间时钟差会直接变成画面错位！");
+	}
 }
 
 static void detach_from_output(void)
@@ -166,12 +203,49 @@ static int64_t utc_ms_now(void)
 	return (int64_t)duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+/* 校时后的当前时间（界面显示用，与写进 SEI 的 FSTS 同一时间轴） */
+static int64_t corrected_utc_ms_now(void)
+{
+	return xinxang_sntp_correct_ms(utc_ms_now());
+}
+
+static void update_sntp_status_label(void)
+{
+	if (!xxs.sntp_status_label)
+		return;
+
+	if (!xxs.sntp_enabled) {
+		xxs.sntp_status_label->setText(QStringLiteral("未启用（FSTS 用本机时钟，多机推流会错位）"));
+		xxs.sntp_status_label->setStyleSheet("QLabel { color: #f0a05a; }");
+		return;
+	}
+
+	int64_t offset = 0, target = 0, rtt = 0, age = 0;
+	if (!xinxang_sntp_status(&offset, &target, &rtt, &age)) {
+		xxs.sntp_status_label->setText(QStringLiteral("校时中…（失败则用本机时钟，见日志）"));
+		xxs.sntp_status_label->setStyleSheet("QLabel { color: #f0a05a; }");
+		return;
+	}
+
+	QString extra;
+	if (offset != target)
+		extra = QStringLiteral("，缓变中→%1ms").arg((long long)target);
+
+	xxs.sntp_status_label->setText(QStringLiteral("偏移 %1ms，RTT %2ms，%3 秒前校时%4")
+					       .arg((long long)offset)
+					       .arg((long long)rtt)
+					       .arg((long long)(age / 1000))
+					       .arg(extra));
+	xxs.sntp_status_label->setStyleSheet("QLabel { color: #7fd18b; }");
+}
+
 static void update_timestamp_label(void)
 {
 	if (!xxs.timestamp_label)
 		return;
 
-	const int64_t ms = utc_ms_now();
+	/* 显示校时后的时间——这就是写进 SEI 的 FSTS 所在的时间轴 */
+	const int64_t ms = corrected_utc_ms_now();
 	const QTimeZone tz = QTimeZone::fromSecondsAheadOfUtc(8 * 60 * 60);
 	const QDateTime dt = QDateTime::fromMSecsSinceEpoch(ms, tz);
 	xxs.timestamp_label->setText(dt.toString("yyyy-MM-dd HH:mm:ss.zzz"));
@@ -257,13 +331,35 @@ static void ensure_settings_dialog(void)
 	form->addRow(xxs.enabled_checkbox);
 	form->addRow(QStringLiteral("客户端名字"), xxs.client_name_edit);
 
+	/* SNTP 校时 */
+	xxs.sntp_checkbox = new QCheckBox(QStringLiteral("启用 SNTP 校时（多机推流必开）"), dlg);
+	xxs.sntp_checkbox->setChecked(xxs.sntp_enabled);
+	xxs.sntp_server_edit = new QLineEdit(QString::fromUtf8(xxs.sntp_server_storage.array), dlg);
+	xxs.sntp_server_edit->setPlaceholderText(QStringLiteral("ntp.tencent.com"));
+	form->addRow(xxs.sntp_checkbox);
+	form->addRow(QStringLiteral("校时服务器"), xxs.sntp_server_edit);
+
 	root->addLayout(form);
+
+	/* SNTP 状态 + 立即校时 */
+	auto *sntpRow = new QHBoxLayout();
+	sntpRow->setSpacing(10);
+	xxs.sntp_status_label = new QLabel(dlg);
+	xxs.sntp_status_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	xxs.sntp_status_label->setWordWrap(true);
+	auto *syncBtn = new QPushButton(QStringLiteral("立即校时"), dlg);
+	QObject::connect(syncBtn, &QPushButton::clicked, []() { xinxang_sntp_sync_now(); });
+	sntpRow->addWidget(xxs.sntp_status_label, 1);
+	sntpRow->addWidget(syncBtn);
+	root->addLayout(sntpRow);
+	update_sntp_status_label();
+
 	root->addSpacing(12);
 
 	/* Timestamp */
 	auto *tsRow = new QHBoxLayout();
 	tsRow->setSpacing(10);
-	auto *tsTitle = new QLabel(QStringLiteral("时间戳（UTC+8）:"), dlg);
+	auto *tsTitle = new QLabel(QStringLiteral("时间戳（校时后，UTC+8）:"), dlg);
 	xxs.timestamp_label = new QLabel(dlg);
 	xxs.timestamp_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
 	xxs.timestamp_label->setStyleSheet("QLabel { color: #dfe3ee; font-weight: 600; }");
@@ -272,7 +368,10 @@ static void ensure_settings_dialog(void)
 	root->addLayout(tsRow);
 
 	xxs.timestamp_timer = new QTimer(dlg);
-	QObject::connect(xxs.timestamp_timer, &QTimer::timeout, []() { update_timestamp_label(); });
+	QObject::connect(xxs.timestamp_timer, &QTimer::timeout, []() {
+		update_timestamp_label();
+		update_sntp_status_label();
+	});
 	xxs.timestamp_timer->start(200);
 	update_timestamp_label();
 
@@ -300,8 +399,15 @@ static void ensure_settings_dialog(void)
 		if (name.isEmpty())
 			name = QStringLiteral("RabbitJun");
 
-		save_config(enabled, name.toUtf8().constData());
-		load_config(); /* refresh in-memory config */
+		const bool sntp_on = xxs.sntp_checkbox ? xxs.sntp_checkbox->isChecked() : false;
+		QString srv = xxs.sntp_server_edit ? xxs.sntp_server_edit->text().trimmed() : QString();
+		if (srv.isEmpty())
+			srv = QStringLiteral("ntp.tencent.com");
+
+		save_config(enabled, name.toUtf8().constData(), sntp_on, srv.toUtf8().constData());
+		load_config();       /* refresh in-memory config */
+		apply_sntp_service(); /* 按新配置起停校时 */
+		update_sntp_status_label();
 		QMessageBox::information(dlg, QStringLiteral("帧同步插件"), QStringLiteral("已保存配置。重启推流后生效。"));
 	});
 	QObject::connect(buttons->button(QDialogButtonBox::Close), &QPushButton::clicked, dlg, &QDialog::close);
@@ -354,7 +460,15 @@ static void on_frontend_event(enum obs_frontend_event event, void *private_data)
 
 bool obs_module_load(void)
 {
+#ifndef XINXANG_SEI_VERSION
+#define XINXANG_SEI_VERSION "dev"
+#endif
+	blog(LOG_INFO, "[xinxang-sei] 帧同步插件 v%s 加载（丂渐）", XINXANG_SEI_VERSION);
+
+	xxs.sntp_enabled = true;
+	dstr_init_copy(&xxs.sntp_server_storage, "ntp.tencent.com");
 	load_config();
+	apply_sntp_service(); /* 起播前就把时钟校正做好 */
 	obs_frontend_add_event_callback(on_frontend_event, NULL);
 	return true;
 }
@@ -363,12 +477,17 @@ void obs_module_unload(void)
 {
 	obs_frontend_remove_event_callback(on_frontend_event, NULL);
 	detach_from_output();
+	xinxang_sntp_stop();
 	dstr_free(&xxs.client_name_storage);
+	dstr_free(&xxs.sntp_server_storage);
 	xxs.tools_action = nullptr;
 	xxs.settings_dialog = nullptr;
 	xxs.enabled_checkbox = nullptr;
 	xxs.client_name_edit = nullptr;
 	xxs.timestamp_label = nullptr;
 	xxs.timestamp_timer = nullptr;
+	xxs.sntp_checkbox = nullptr;
+	xxs.sntp_server_edit = nullptr;
+	xxs.sntp_status_label = nullptr;
 }
 
