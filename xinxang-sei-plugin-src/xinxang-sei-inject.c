@@ -154,8 +154,11 @@ void xinxang_sei_inject(obs_output_t *output, struct encoder_packet *pkt, struct
 			return;
 	}
 
-	const char *client_name = cfg->client_name;
-	if (!client_name || !*client_name)
+	/* 拷到栈上再组 SEI，避免和保存配置的写入抢同一段缓冲。 */
+	char client_name[257];
+	memcpy(client_name, cfg->client_name, sizeof(client_name) - 1);
+	client_name[sizeof(client_name) - 1] = '\0';
+	if (!client_name[0])
 		return;
 
 	const char *codec = obs_encoder_get_codec(pkt->encoder);

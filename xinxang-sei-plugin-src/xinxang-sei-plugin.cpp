@@ -4,6 +4,8 @@
 #include <util/platform.h>
 #include <util/dstr.h>
 
+#include <string.h>
+
 #include <chrono>
 
 #include <QAction>
@@ -33,7 +35,6 @@ OBS_MODULE_USE_DEFAULT_LOCALE("xinxang-sei", "en-US")
 
 static struct {
 	struct xinxang_sei_config cfg;
-	struct dstr client_name_storage;
 	obs_output_t *attached_output;
 	QAction *tools_action;
 	QPointer<QDialog> settings_dialog;
@@ -80,12 +81,10 @@ static void load_config(void)
 	xxs.cfg.only_rtmp_output = obs_data_get_bool(data, "only_rtmp_output");
 
 	const char *name = obs_data_get_string(data, "client_name");
-	dstr_copy(&xxs.client_name_storage, name ? name : "");
-	dstr_depad(&xxs.client_name_storage);
-	if (xxs.client_name_storage.len == 0)
-		dstr_copy(&xxs.client_name_storage, "RabbitJun");
-
-	xxs.cfg.client_name = xxs.client_name_storage.array;
+	if (!name || !*name)
+		name = "RabbitJun";
+	strncpy(xxs.cfg.client_name, name, sizeof(xxs.cfg.client_name) - 1);
+	xxs.cfg.client_name[sizeof(xxs.cfg.client_name) - 1] = '\0';
 
 	xxs.sntp_enabled = obs_data_get_bool(data, "sntp_enabled");
 	const char *srv = obs_data_get_string(data, "sntp_server");
@@ -135,15 +134,20 @@ static void save_config(bool enabled, const char *client_name, bool sntp_enabled
 	bfree(path);
 }
 
-/* 按当前配置启动/停止 SNTP 校时 */
+/* 按当前配置启动/停止 SNTP 校时。
+ * 开关和服务器都没变时不拆线程，避免推流中保存把 FSTS 打回本机时钟。 */
 static void apply_sntp_service(void)
 {
-	xinxang_sntp_stop();
 	if (xxs.sntp_enabled) {
+		if (xinxang_sntp_same(xxs.sntp_server_storage.array)) {
+			blog(LOG_INFO, "[xinxang-sei] SNTP 配置未变，保持当前校时");
+			return;
+		}
 		xinxang_sntp_start(xxs.sntp_server_storage.array, 600);
 		blog(LOG_INFO, "[xinxang-sei] FSTS 将使用校时后的时间（偏移由 SNTP 缓变施加，不会跳变）");
 	} else {
-		blog(LOG_WARNING, "[xinxang-sei] SNTP 已关闭：FSTS 用本机时钟。"
+		xinxang_sntp_disable();
+		blog(LOG_WARNING, "[xinxang-sei] SNTP 已关闭：偏移缓变回本机时钟。"
 				  "多台 OBS 各推一路时，机器间时钟差会直接变成画面错位！");
 	}
 }
@@ -167,31 +171,28 @@ static void try_attach_to_streaming_output(void)
 		return;
 	}
 
+	/* get_streaming_output 已加过一次引用，不要再 get_ref。 */
 	obs_output_t *out = obs_frontend_get_streaming_output();
 	if (!out)
 		return;
 
-	obs_output_t *out_ref = obs_output_get_ref(out);
-	if (!out_ref)
-		return;
-
 	if (xxs.cfg.only_rtmp_output) {
-		const char *id = obs_output_get_id(out_ref);
+		const char *id = obs_output_get_id(out);
 		if (!id || strcmp(id, "rtmp_output") != 0) {
-			obs_output_release(out_ref);
+			obs_output_release(out);
 			return;
 		}
 	}
 
 	/* avoid double-attach */
-	if (xxs.attached_output == out_ref) {
-		obs_output_release(out_ref);
+	if (xxs.attached_output == out) {
+		obs_output_release(out);
 		return;
 	}
 
 	detach_from_output();
 
-	xxs.attached_output = out_ref;
+	xxs.attached_output = out;
 	blog(LOG_INFO, "[xinxang-sei] attaching packet callback to output '%s' (id=%s), client_name='%s'",
 	     obs_output_get_name(xxs.attached_output), obs_output_get_id(xxs.attached_output), xxs.cfg.client_name);
 	obs_output_add_packet_callback(xxs.attached_output, xinxang_sei_inject, &xxs.cfg);
@@ -327,7 +328,8 @@ static void ensure_settings_dialog(void)
 	xxs.enabled_checkbox = new QCheckBox(QStringLiteral("启用"), dlg);
 	xxs.enabled_checkbox->setChecked(xxs.cfg.enabled);
 
-	xxs.client_name_edit = new QLineEdit(QString::fromUtf8(xxs.cfg.client_name ? xxs.cfg.client_name : "RabbitJun"), dlg);
+	xxs.client_name_edit = new QLineEdit(
+		QString::fromUtf8(xxs.cfg.client_name[0] ? xxs.cfg.client_name : "RabbitJun"), dlg);
 	form->addRow(xxs.enabled_checkbox);
 	form->addRow(QStringLiteral("客户端名字"), xxs.client_name_edit);
 
@@ -478,7 +480,6 @@ void obs_module_unload(void)
 	obs_frontend_remove_event_callback(on_frontend_event, NULL);
 	detach_from_output();
 	xinxang_sntp_stop();
-	dstr_free(&xxs.client_name_storage);
 	dstr_free(&xxs.sntp_server_storage);
 	xxs.tools_action = nullptr;
 	xxs.settings_dialog = nullptr;

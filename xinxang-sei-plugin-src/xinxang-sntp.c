@@ -42,9 +42,14 @@ typedef int xxsock;
 
 static volatile bool sntp_running = false;
 static volatile bool sntp_need_query = false;
+/* 用户关闭校时：不再查询，把目标缓变到 0。线程保持到卸载，避免保存时拆线程。 */
+static volatile bool sntp_retire = false;
+/* 进程内只允许一次「立即采用」。之后（含换服务器、重新打开）一律缓变。 */
+static bool sntp_has_sync = false;
+static bool sntp_thread_alive = false;
 /* OBS 32.x 已移除 os_thread_*，直接用 pthread（Windows 上走 w32-pthreads） */
 static pthread_t sntp_thread_id;
-static pthread_mutex_t sntp_lock;
+static pthread_mutex_t sntp_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* 以下四个量都用锁保护（校时间隔很长，锁竞争可忽略） */
 static int64_t sntp_applied_offset = 0; /* 当前生效 */
@@ -221,13 +226,14 @@ static void *sntp_thread(void *unused)
 {
 	(void)unused;
 
-	bool first_sync_done = false;
 	int backoff_s = 5;
 	int64_t next_query_ms = 0;
 
 	while (sntp_running) {
-		/* 1) 需要查询就查一次 */
-		if (sntp_need_query || now_ms() >= next_query_ms) {
+		bool retire = sntp_retire;
+
+		/* 1) 关闭缓变期间不再查询 */
+		if (!retire && (sntp_need_query || now_ms() >= next_query_ms)) {
 			sntp_need_query = false;
 			int64_t off = 0, rtt = 0;
 			char server[256];
@@ -238,23 +244,29 @@ static void *sntp_thread(void *unused)
 
 			if (xinxang_sntp_query_once(server, &off, &rtt)) {
 				lock();
-				sntp_target_offset = off;
-				sntp_last_rtt = rtt;
-				sntp_last_sync_ms = now_ms();
-				if (!first_sync_done) {
-					/* 首次：直接采用（发生在插件加载时，尚未推流，跳变无副作用） */
-					sntp_applied_offset = off;
-					first_sync_done = true;
-					unlock();
-					blog(LOG_INFO, "[xinxang-sei] SNTP 首次校时成功：%s 偏移 %lldms（RTT %lldms），已立即采用",
-					     server, (long long)off, (long long)rtt);
-				} else {
-					const int64_t delta = off - sntp_applied_offset;
-					unlock();
-					if (delta != 0)
+				/* 查询期间用户可能已关闭校时，不要把目标又写回去 */
+				if (!sntp_retire) {
+					sntp_target_offset = off;
+					sntp_last_rtt = rtt;
+					sntp_last_sync_ms = now_ms();
+					if (!sntp_has_sync) {
+						sntp_applied_offset = off;
+						sntp_has_sync = true;
+						unlock();
 						blog(LOG_INFO,
-						     "[xinxang-sei] SNTP 校时：目标偏移 %lldms，与当前的差 %lldms，开始缓变（≤%dms/秒）",
-						     (long long)off, (long long)delta, SLEW_STEP_MS * (1000 / SLEW_TICK_MS));
+						     "[xinxang-sei] SNTP 首次校时成功：%s 偏移 %lldms（RTT %lldms），已立即采用",
+						     server, (long long)off, (long long)rtt);
+					} else {
+						const int64_t delta = off - sntp_applied_offset;
+						unlock();
+						if (delta != 0)
+							blog(LOG_INFO,
+							     "[xinxang-sei] SNTP 校时：目标偏移 %lldms，与当前的差 %lldms，开始缓变（≤%dms/秒）",
+							     (long long)off, (long long)delta,
+							     SLEW_STEP_MS * (1000 / SLEW_TICK_MS));
+					}
+				} else {
+					unlock();
 				}
 				backoff_s = 5;
 				int interval = 600;
@@ -262,7 +274,7 @@ static void *sntp_thread(void *unused)
 				interval = sntp_interval_s;
 				unlock();
 				next_query_ms = now_ms() + (int64_t)interval * 1000;
-			} else {
+			} else if (!sntp_retire) {
 				blog(LOG_WARNING, "[xinxang-sei] SNTP 校时失败（%s），%d 秒后重试；未校时期间 FSTS 用本机时钟",
 				     server, backoff_s);
 				next_query_ms = now_ms() + (int64_t)backoff_s * 1000;
@@ -288,42 +300,72 @@ static void *sntp_thread(void *unused)
 
 bool xinxang_sntp_start(const char *server, int interval_s)
 {
-	if (sntp_running)
-		return true;
-
+	lock();
 	if (server && *server) {
 		strncpy(sntp_server, server, sizeof(sntp_server) - 1);
 		sntp_server[sizeof(sntp_server) - 1] = 0;
 	}
 	if (interval_s >= 10)
 		sntp_interval_s = interval_s;
+	sntp_retire = false;
+	sntp_need_query = true;
+	const bool alive = sntp_thread_alive;
+	if (!alive) {
+		sntp_running = true;
+		sntp_thread_alive = true;
+	}
+	char logged[256];
+	strncpy(logged, sntp_server, sizeof(logged) - 1);
+	logged[sizeof(logged) - 1] = 0;
+	const int interval = sntp_interval_s;
+	unlock();
 
-	pthread_mutex_init(&sntp_lock, NULL);
-	sntp_running = true;
-	sntp_need_query = true; /* 启动即查一次 */
+	if (alive) {
+		blog(LOG_INFO, "[xinxang-sei] SNTP 已在运行，更新为 %s（不重启线程）", logged);
+		return true;
+	}
 
 	if (pthread_create(&sntp_thread_id, NULL, sntp_thread, NULL) != 0) {
+		lock();
 		sntp_running = false;
-		pthread_mutex_destroy(&sntp_lock);
+		sntp_thread_alive = false;
+		unlock();
 		return false;
 	}
-	blog(LOG_INFO, "[xinxang-sei] SNTP 校时已启动：服务器 %s，间隔 %d 秒", sntp_server, sntp_interval_s);
+	blog(LOG_INFO, "[xinxang-sei] SNTP 校时已启动：服务器 %s，间隔 %d 秒", logged, interval);
 	return true;
+}
+
+void xinxang_sntp_disable(void)
+{
+	lock();
+	sntp_retire = true;
+	sntp_target_offset = 0;
+	unlock();
+	blog(LOG_INFO, "[xinxang-sei] SNTP 关闭：偏移缓变回 0，FSTS 不会立刻跳回本机时钟");
+}
+
+bool xinxang_sntp_same(const char *server)
+{
+	if (!server)
+		server = "";
+	lock();
+	const bool same = sntp_thread_alive && sntp_running && !sntp_retire && strcmp(sntp_server, server) == 0;
+	unlock();
+	return same;
 }
 
 void xinxang_sntp_stop(void)
 {
-	if (!sntp_running)
+	if (!sntp_thread_alive)
 		return;
 	sntp_running = false;
 	pthread_join(sntp_thread_id, NULL);
-	pthread_mutex_destroy(&sntp_lock);
+	sntp_thread_alive = false;
 }
 
 int64_t xinxang_sntp_offset_ms(void)
 {
-	if (!sntp_running)
-		return 0;
 	lock();
 	const int64_t v = sntp_applied_offset;
 	unlock();

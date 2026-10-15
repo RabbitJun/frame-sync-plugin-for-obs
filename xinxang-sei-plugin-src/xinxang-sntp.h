@@ -22,13 +22,21 @@ extern "C" {
  * 因此除首次校时外，所有修正都按有限速率**缓变**过去。
  */
 
-/* 启动后台校时线程。server 如 "ntp.tencent.com"，interval_s 为重同步间隔。 */
+/* 启动后台校时线程。server 如 "ntp.tencent.com"，interval_s 为重同步间隔。
+ * 线程已在跑时只更新服务器并触发一次查询，不拆线程。
+ * 进程内第一次成功校时立即采用；之后一律缓变。 */
 bool xinxang_sntp_start(const char *server, int interval_s);
 
-/* 停止后台线程（进程退出/插件卸载时调用）。 */
+/* 用户关闭校时：目标偏移缓变到 0，不阻塞调用方，也不把 FSTS 立刻打回本机时钟。 */
+void xinxang_sntp_disable(void);
+
+/* 线程在跑、未处于关闭缓变，且当前服务器与 server 相同。 */
+bool xinxang_sntp_same(const char *server);
+
+/* 停止后台线程（仅插件卸载时调用）。 */
 void xinxang_sntp_stop(void);
 
-/* 当前生效的时钟偏移（毫秒）。FSTS = 本机时钟 + 该值。 */
+/* 当前生效的时钟偏移（毫秒）。线程暂停或正在缓变回 0 时仍返回该值，不突然变成 0。 */
 int64_t xinxang_sntp_offset_ms(void);
 
 /* 把本机 Unix 毫秒校正为参考时间轴的毫秒（写 FSTS 用这个）。 */
